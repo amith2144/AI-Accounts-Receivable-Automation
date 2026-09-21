@@ -1,0 +1,187 @@
+# ==============================================================================
+# Docker Compose Orchestration
+# Stack: backend-api, admin-dashboard, nginx-gateway, postgres-db, minio-storage, redis-cache
+# ==============================================================================
+
+name: ar-platform
+
+networks:
+  ar_network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+
+services:
+  # Relational Database: PostgreSQL 16
+  postgres-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-ar_platform}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-ar_platform}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - ar_network
+
+  # Task Queue & Cache Broker: Redis 7
+  redis-cache:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ar_network
+
+  # S3-Compatible Object Storage: MinIO
+  minio-storage:
+    image: quay.io/minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9000/minio/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - ar_network
+
+  # FastAPI Backend API Service
+  backend-api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      DEBUG: ${DEBUG:-false}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres-db:5432/${POSTGRES_DB:-ar_platform}
+      REDIS_URL: redis://redis-cache:6379/0
+      CELERY_BROKER_URL: redis://redis-cache:6379/0
+      CELERY_RESULT_BACKEND: redis://redis-cache:6379/0
+      MINIO_ENDPOINT: minio-storage:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_BUCKET: ${MINIO_BUCKET:-ar-documents}
+      MINIO_SECURE: "false"
+      CORS_ORIGINS: '["http://localhost", "http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:80", "http://localhost:3000"]'
+      SECRET_KEY: ${SECRET_KEY:-dev-insecure-secret-key-change-in-production-must-be-at-least-32-chars}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres-db:
+        condition: service_healthy
+      redis-cache:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/api/v1/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - ar_network
+
+  # Frontend Operational Dashboard (React 18 + Vite 5)
+  admin-dashboard:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      BACKEND_URL: http://backend-api:8000
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend-api
+    networks:
+      - ar_network
+
+  # Celery Asynchronous Worker (Document OCR & Extraction)
+  celery-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["celery", "-A", "app.workers.celery_app.celery_app", "worker", "--loglevel=info", "--concurrency=2"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres-db:5432/${POSTGRES_DB:-ar_platform}
+      REDIS_URL: redis://redis-cache:6379/0
+      CELERY_BROKER_URL: redis://redis-cache:6379/0
+      CELERY_RESULT_BACKEND: redis://redis-cache:6379/0
+      MINIO_ENDPOINT: minio-storage:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_BUCKET: ${MINIO_BUCKET:-ar-documents}
+      MINIO_SECURE: "false"
+      SECRET_KEY: ${SECRET_KEY:-dev-insecure-secret-key-change-in-production-must-be-at-least-32-chars}
+    depends_on:
+      postgres-db:
+        condition: service_healthy
+      redis-cache:
+        condition: service_healthy
+    networks:
+      - ar_network
+
+  # Celery Beat Scheduler (Periodic Aging Recalculation & Reminder Batches)
+  celery-beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["celery", "-A", "app.workers.celery_app.celery_app", "beat", "--loglevel=info", "-s", "/tmp/celerybeat-schedule"]
+    environment:
+      REDIS_URL: redis://redis-cache:6379/0
+      CELERY_BROKER_URL: redis://redis-cache:6379/0
+      CELERY_RESULT_BACKEND: redis://redis-cache:6379/0
+      SECRET_KEY: ${SECRET_KEY:-dev-insecure-secret-key-change-in-production-must-be-at-least-32-chars}
+    depends_on:
+      redis-cache:
+        condition: service_healthy
+    networks:
+      - ar_network
+
+  # Nginx Gateway Reverse Proxy
+  nginx-gateway:
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - backend-api
+      - admin-dashboard
+    networks:
+      - ar_network
